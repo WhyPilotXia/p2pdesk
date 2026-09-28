@@ -1,0 +1,12 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS / Windows junk
+.DS_Store
+Thumbs.db
