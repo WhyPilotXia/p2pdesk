@@ -37,7 +37,11 @@ def load_env():
 load_env()
 
 PORT = int(os.environ.get("P2PDESK_PORT", "9000"))
-TOKEN = os.environ.get("P2PDESK_TOKEN", "REDACTED-TOKEN")
+TOKEN = os.environ.get("P2PDESK_TOKEN", "")
+
+if not TOKEN:
+    print("[!] P2PDESK_TOKEN not set. Copy server/.env.example to server/.env and fill it in.")
+    raise SystemExit(1)
 
 peers = {}  # id -> websocket
 
