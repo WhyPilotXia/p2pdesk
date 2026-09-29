@@ -1,4 +1,5 @@
 @echo off
+setlocal EnableDelayedExpansion
 chcp 65001 >nul
 cd /d %~dp0
 echo === p2pdesk : control remote PC ===
@@ -17,8 +18,8 @@ if "%~1"=="" (
     python p2pdesk.py list
     echo.
     set /p PEER=Enter peer id to control: 
-    if "%PEER%"=="" ( echo [!] empty peer id & pause & exit /b 1 )
-    set PEER_ARG=%PEER%
+    if "!PEER!"=="" ( echo [!] empty peer id & pause & exit /b 1 )
+    set PEER_ARG=!PEER!
 ) else (
     set PEER_ARG=%~1
 )
