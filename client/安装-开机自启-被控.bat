@@ -16,7 +16,7 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-python -c "import websockets, cv2, mss, numpy, pyautogui, aiortc" >nul 2>nul
+python -c "import websockets, cv2, mss, numpy, pyautogui, aiortc, pywinpty" >nul 2>nul
 if errorlevel 1 (
     echo [*] installing dependencies ...
     python -m pip install -r requirements.txt -i https://mirrors.tencent.com/pypi/simple

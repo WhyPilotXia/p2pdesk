@@ -35,6 +35,7 @@ python signaling_server.py
 
 - `启动-被控.bat`：本机作为被控端常驻（对方可随时连入控制）。
 - `启动-主控.bat`：控制对方。可拖拽参数运行 `启动-主控.bat 对方ID`，或无参双击后自动列出在线设备再输入 ID。
+- `启动-远程CMD.bat`：连接对方并获得一个真实终端（ConPTY），颜色/方向键/Ctrl 快捷键全支持。可拖拽 `启动-远程CMD.bat 对方ID`。
 - `启动-看在线.bat`：仅查看当前在线设备。
 
 ## 开机自启 / 断网自愈（被控端）
@@ -54,15 +55,24 @@ python signaling_server.py
 python p2pdesk.py share           # 被控
 python p2pdesk.py list            # 查看在线 ID
 python p2pdesk.py watch <peer_id> # 控制
+python p2pdesk.py term <peer_id>  # 远程终端（ConPTY）
 ```
 
-`.env` 支持项：`P2PDESK_SERVER`（默认 ws://118.31.105.6:9000）、`P2PDESK_TOKEN`、`P2PDESK_ID`（留空自动用 Windows 用户名）、`P2PDESK_FPS`（默认10）、`P2PDESK_Q`（JPEG质量默认50）、`P2PDESK_P2P_TIMEOUT`（默认25秒后回落）。环境变量优先级高于 `.env`。
+`.env` 支持项：`P2PDESK_SERVER`（默认 ws://118.31.105.6:9000）、`P2PDESK_TOKEN`、`P2PDESK_ID`（留空自动用 Windows 用户名）、`P2PDESK_FPS`（默认10）、`P2PDESK_Q`（JPEG质量默认50）、`P2PDESK_P2P_TIMEOUT`（默认25秒后回落）、`P2PDESK_RENEG_RETRY`（P2P断开后重协商间隔，默认5秒）、`P2PDESK_RENEG_MAX`（重协商最大次数，0=无限）。环境变量优先级高于 `.env`。
+
+## 断线自愈
+
+P2P 直连中断不会断开会话：
+
+1. 立即切换到服务器中继，画面/终端继续可用。
+2. 控制端后台每隔 `P2PDESK_RENEG_RETRY` 秒发起一轮全新 WebRTC 协商（新 ICE 端口重新打洞），成功即无感切回 P2P 直连。
+3. 被控端信令断线同样无限重连，重连后自动恢复在线状态。
 
 ## 协议
 
 - 信令 JSON：`register/list/offer/answer/bye/ping`
 - 中继二进制帧：`[0x01][目标ID][0x00][数据]`，服务器原样转发并替换为来源 ID
-- 媒体帧（两种传输层一致）：`[u32长度][端口0x10图像/0x20事件][载荷]`，图像为 JPEG，事件为 JSON
+- 媒体帧（两种传输层一致）：`[u32长度][端口0x10图像/0x20事件/0x30终端输出/0x31终端输入][载荷]`，图像为 JPEG，事件为 JSON，终端输出为 UTF-8 ANSI 流
 
 ## 注意
 

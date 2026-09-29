@@ -3,22 +3,28 @@
 p2pdesk client (single script, both roles)
   python p2pdesk.py share              : be controlled (register + wait)
   python p2pdesk.py watch <peer_id>    : connect & control remote peer
+  python p2pdesk.py term <peer_id>     : remote ConPTY terminal
   python p2pdesk.py list               : list online peers
 
 Transport preference:
-  1) aiortc DataChannel P2P (screen frames + control events)
+  1) aiortc DataChannel P2P (screen frames + control events + terminal)
   2) fallback: server binary relay over the same ws
+  On P2P failure: keep retrying renegotiation with fresh ICE ports while
+  relaying through the server, so the session never dies on transient holes.
 
 Frame format (both transports): [u32 len][port u8][payload]
   port 0x10 = jpeg screen frame, 0x20 = json control event
+  port 0x30 = terminal ansi output chunk, 0x31 = terminal stdin/control json
 Env: P2PDESK_SERVER, P2PDESK_TOKEN, P2PDESK_ID, P2PDESK_FPS,
-     P2PDESK_Q, P2PDESK_P2P_TIMEOUT, P2PDESK_ICE
+     P2PDESK_Q, P2PDESK_P2P_TIMEOUT, P2PDESK_RENEG_RETRY, P2PDESK_ICE
 """
 import asyncio
 import json
 import os
 import struct
+import subprocess
 import sys
+import threading
 import time
 
 import websockets
@@ -58,6 +64,8 @@ if not TOKEN:
 FPS = int(os.environ.get("P2PDESK_FPS", "10"))
 JPEG_Q = int(os.environ.get("P2PDESK_Q", "50"))
 P2P_TIMEOUT = int(os.environ.get("P2PDESK_P2P_TIMEOUT", "25"))
+RENEG_RETRY = float(os.environ.get("P2PDESK_RENEG_RETRY", "5"))     # renegotiate interval
+RENEG_MAX = int(os.environ.get("P2PDESK_RENEG_MAX", "0"))          # 0 = forever
 ICE_SERVERS = os.environ.get(
     "P2PDESK_ICE",
     "stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478",
@@ -81,8 +89,17 @@ try:
 except Exception:
     HAVE_AIORTC = False
 
+try:
+    from pywinpty import PtyConnection  # ConPTY real terminal
+
+    HAVE_CONPTY = True
+except Exception:
+    HAVE_CONPTY = False
+
 CMD_PORT = 0x20
 FRAME_PORT = 0x10
+SHELL_PORT = 0x30       # terminal stdout/ansi stream host -> controller
+SHELLCTL_PORT = 0x31    # terminal stdin / control json controller -> host
 
 
 def die(msg):
@@ -220,6 +237,11 @@ class P2PChannel:
     def is_open(self):
         return self.dc is not None and self.dc.readyState == "open"
 
+    def reset(self):
+        """Drop current dc/pc refs for re-negotiation (same object reused)."""
+        self.ready.clear()
+        self.dc = None
+
     async def send(self, port: int, payload: bytes):
         if self.is_open():
             self.dc.sendMessage(pack_frame(port, payload))
@@ -250,15 +272,51 @@ class Session:
         self.use_relay = False
         self.on_event = None   # controller input events (host side)
         self.on_frame = None   # screen frames (controller side)
+        self.on_shell = None   # terminal output chunks (controller side)
+        self.on_shellctl = None  # terminal stdin/control (host side)
         self.closed = asyncio.Event()
+        # queue outgoing frames while p2p is renegotiating, so no data lost
+        self._outq = asyncio.Queue(maxsize=4096)
+        self._pump_task = None
+        self._send_lock = asyncio.Lock()
+
+    def start_pump(self):
+        if not self._pump_task or self._pump_task.done():
+            self._pump_task = asyncio.ensure_future(self._pump())
+
+    async def _pump(self):
+        """Continuously send queued frames via p2p (or relay fallback).
+        Avoids blocking producers when the dc buffer is temporarily full."""
+        while not self.closed.is_set():
+            try:
+                port, payload = await self._outq.get()
+                if self.p2p.is_open():
+                    await self.p2p.send(port, payload)
+                elif self.use_relay:
+                    await self.sig.send_bin_to(self.peer, pack_frame(port, payload))
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                await asyncio.sleep(0.05)
 
     async def close(self):
         self.closed.set()
+        if self._pump_task and not self._pump_task.done():
+            self._pump_task.cancel()
         await self.p2p.close()
 
     async def route_send(self, port: int, payload: bytes):
         if self.p2p.is_open():
-            await self.p2p.send(port, payload)
+            try:
+                self._outq.put_nowait((port, payload))
+            except asyncio.QueueFull:
+                # drop oldest to make room (screen frames tolerate loss)
+                try:
+                    self._outq.get_nowait()
+                    self._outq.put_nowait((port, payload))
+                except Exception:
+                    pass
+            self.start_pump()
         elif self.use_relay:
             await self.sig.send_bin_to(self.peer, pack_frame(port, payload))
 
@@ -269,7 +327,14 @@ class Session:
             except Exception:
                 pass
         elif port == FRAME_PORT and self.on_frame:
-            await self.on_frame(payload)
+            self.on_frame(payload)
+        elif port == SHELL_PORT and self.on_shell:
+            self.on_shell(payload)
+        elif port == SHELLCTL_PORT and self.on_shellctl:
+            try:
+                await self.on_shellctl(json.loads(payload))
+            except Exception:
+                pass
 
     # relay frames from server: [0x01][src][0x00][frame]
     async def on_relay_bin(self, raw: bytes):
@@ -286,6 +351,171 @@ class Session:
             pass
 
 
+# ------------------------- p2p (re)negotiation helpers -------------------------
+
+async def build_and_offer(sess: Session, sig: Signaling, gen: int) -> bool:
+    """(Re)create pc + datachannel and send a fresh offer (new ICE ports)."""
+    try:
+        p2p = sess.p2p
+        await p2p.close()
+        p2p.reset()
+        p2p.on_frame = sess._dispatch
+        p2p._mk_pc()
+        p2p.dc = p2p.pc.createDataChannel("p2pdesk")
+        p2p._bind(p2p.dc)
+        await p2p.pc.setLocalDescription(await p2p.pc.createOffer())
+        await sig.send({"type": "offer", "to": sess.peer,
+                        "sdp": p2p.pc.localDescription.sdp,
+                        "sdpType": p2p.pc.localDescription.type,
+                        "gen": gen})
+        return True
+    except Exception as e:
+        print(f"[!] offer failed: {e}", flush=True)
+        return False
+
+
+class Renegotiator:
+    """While P2P is down: keep re-offering with fresh ICE ports every
+    RENEG_RETRY seconds, session stays alive on server relay meanwhile."""
+
+    def __init__(self, sess: Session, sig: Signaling):
+        self.sess = sess
+        self.sig = sig
+        self.gen = 0
+        self._task = None
+
+    async def offer(self):
+        self.gen += 1
+        return await build_and_offer(self.sess, self.sig, self.gen)
+
+    def start(self):
+        if not self._task or self._task.done():
+            self._task = asyncio.ensure_future(self._loop())
+
+    async def _loop(self):
+        n = 0
+        while not self.sess.closed.is_set():
+            await asyncio.sleep(RENEG_RETRY)
+            if self.sess.closed.is_set() or self.sess.p2p.is_open():
+                if self.sess.p2p.is_open():
+                    print("[i] P2P recovered", flush=True)
+                return
+            n += 1
+            if RENEG_MAX and n > RENEG_MAX:
+                print("[i] P2P retries exhausted, staying on server relay", flush=True)
+                return
+            print(f"[*] P2P retry #{n}: new offer with fresh ICE ports ...", flush=True)
+            await self.offer()
+
+
+# ------------------------- conpty terminal (host side) -------------------------
+
+class TerminalService:
+    """Real Windows terminal (ConPTY via pywinpty) attached to a session.
+    Lazy: spawned on first use, survives P2P renegotiation (tied to session)."""
+
+    def __init__(self, sess: Session):
+        self.sess = sess
+        self.pty = None
+        self.cols, self.rows = 120, 30
+        self.loop = None
+        self._warned = False
+
+    def _open(self):
+        if self.pty is not None:
+            return True
+        if not HAVE_CONPTY:
+            if not self._warned:
+                print("[!] pywinpty missing -> remote terminal unavailable "
+                      "(pip install pywinpty)", flush=True)
+                self._warned = True
+            return False
+        cwd = os.getcwd()
+        cmdline = 'cmd.exe /K "chcp 65001>nul"'
+        for args in (cmdline, cwd, None, self.cols, self.rows), \
+                    (["cmd.exe", "/K", "chcp 65001>nul"], cwd, None, self.cols, self.rows):
+            try:
+                self.pty = PtyConnection.spawn(*args)
+                break
+            except TypeError:
+                continue
+            except Exception as e:
+                print(f"[!] terminal spawn failed: {e}", flush=True)
+                self.pty = None
+                return False
+        if self.pty is None:
+            print("[!] terminal spawn failed: unsupported pywinpty API", flush=True)
+            return False
+        self.loop = asyncio.get_event_loop()
+        threading.Thread(target=self._reader, daemon=True).start()
+        print("[i] remote terminal opened (ConPTY)", flush=True)
+        return True
+
+    def _write(self, text: str):
+        data = text.encode("utf-8")
+        try:
+            self.pty.write(data)
+        except TypeError:
+            self.pty.write(text)
+        except Exception as e:
+            print(f"[!] terminal write error: {e}", flush=True)
+
+    def _reader(self):
+        """Thread: pump pty output to SHELL_PORT. On pty death notify ctrl."""
+        while self.pty is not None:
+            try:
+                data = self.pty.read(4096)
+            except Exception:
+                break
+            if data:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.sess.route_send(SHELL_PORT, bytes(data)), self.loop).result(5)
+                except Exception:
+                    return
+            else:
+                time.sleep(0.02)
+        if self.pty is not None:
+            self.pty = None
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.sess.route_send(
+                        SHELL_PORT, b"\x00" + json.dumps({"t": "closed"}).encode()),
+                    self.loop).result(3)
+            except Exception:
+                pass
+
+    async def on_ctl(self, msg: dict):
+        t = msg.get("t")
+        if t == "open":
+            if self.pty is None:
+                self._open()
+            return
+        if t == "resize":
+            try:
+                self.cols, self.rows = int(msg["cols"]), int(msg["rows"])
+            except Exception:
+                return
+            if self.pty is not None:
+                try:
+                    self.pty.set_size(self.cols, self.rows)
+                except Exception:
+                    pass
+            return
+        if t == "in":
+            if self.pty is None and not self._open():
+                return
+            self._write(msg.get("d", ""))
+
+    def close(self):
+        pty, self.pty = self.pty, None
+        if pty is not None:
+            try:
+                pty.close()
+            except Exception:
+                pass
+
+
 # ------------------------- host (be controlled) -------------------------
 
 class Host:
@@ -293,6 +523,9 @@ class Host:
         self.sig = sig
         self.sess = None
         self.stream_task = None
+        self.term = None
+        self.reneg = None
+        self._neg_lock = asyncio.Lock()
         self.sig.on_disconnect = self._on_sig_lost
 
     async def run(self):
@@ -309,11 +542,16 @@ class Host:
     async def _on_msg(self, msg):
         t = msg.get("type")
         if t == "offer":
-            print(f"[*] incoming connection from '{msg['from']}'", flush=True)
-            await self._stop(quiet=True)
-            self._new_session(msg["from"])
-            await self._accept_offer(msg)
-            asyncio.ensure_future(self._wait_transport())
+            print(f"[*] incoming connection from '{msg['from']}' (gen {msg.get('gen', '?')})", flush=True)
+            async with self._neg_lock:
+                if self.sess and self.sess.peer == msg["from"] and not self.sess.closed.is_set():
+                    # renegotiation offer from same controller: keep session alive
+                    await self._accept_offer(msg, renegotiate=True)
+                    return
+                await self._stop(quiet=True)
+                self._new_session(msg["from"])
+                await self._accept_offer(msg)
+                asyncio.ensure_future(self._wait_transport())
         elif t == "bye":
             await self._stop()
         elif t == "peer-offline" and self.sess and msg.get("peer") == self.sess.peer:
@@ -322,26 +560,43 @@ class Host:
     def _new_session(self, peer):
         self.sess = Session(self.sig, peer)
         self.sess.on_event = self.exec_event
+        self.sess.on_shellctl = None  # set once terminal service created
         self.sess.p2p.on_state = self._on_p2p_state
         self.sig.on_bin = self._on_bin
+        self.term = TerminalService(self.sess)
+        self.sess.on_shellctl = self.term.on_ctl
+        self.reneg = Renegotiator(self.sess, self.sig)
 
     def _on_p2p_state(self, state):
         if state in ("failed", "closed", "disconnected"):
-            asyncio.ensure_future(self._stop())
+            if self.sess and not self.sess.closed.is_set():
+                print("[!] P2P down -> server relay, renegotiation in background", flush=True)
+                self.sess.use_relay = True
+                self.sess.start_pump()
+                if self.reneg:
+                    self.reneg.start()
+                # do NOT stop session: relay keeps it alive
 
-    async def _accept_offer(self, msg):
+    async def _accept_offer(self, msg, renegotiate=False):
         p2p = self.sess.p2p
         p2p.on_frame = self.sess._dispatch
-        p2p._mk_pc()
+        if not renegotiate:
+            p2p._mk_pc()
+        else:
+            # fresh pc with fresh ICE ports, same P2PChannel object
+            await p2p.close()
+            p2p.reset()
+            p2p._mk_pc()
         await p2p.pc.setRemoteDescription(RTCSessionDescription(sdp=msg["sdp"], type=msg["sdpType"]))
         await p2p.pc.setLocalDescription(await p2p.pc.createAnswer())
         await self.sig.send({"type": "answer", "to": msg["from"],
                              "sdp": p2p.pc.localDescription.sdp,
-                             "sdpType": p2p.pc.localDescription.type})
+                             "sdpType": p2p.pc.localDescription.type,
+                             "gen": msg.get("gen")})
         print("    [p2p] answer sent", flush=True)
 
     async def _wait_transport(self):
-        # wait p2p open; on timeout switch to relay
+        # wait p2p open; on timeout switch to relay (session stays alive)
         try:
             await asyncio.wait_for(self.sess.p2p.ready.wait(), P2P_TIMEOUT)
             self._start_stream()
@@ -350,12 +605,10 @@ class Host:
             pass
         print("[!] P2P failed/timeout -> server relay mode", flush=True)
         self.sess.use_relay = True
+        self.sess.start_pump()
+        if self.reneg:
+            self.reneg.start()
         self._start_stream()
-
-    def _start_stream(self):
-        if self.stream_task and not self.stream_task.done():
-            return
-        self.stream_task = asyncio.ensure_future(self._screen_loop())
 
     async def _stop(self, quiet=False):
         if not self.sess:
@@ -363,6 +616,9 @@ class Host:
         if not quiet:
             print("[*] session closed by peer", flush=True)
         sess, self.sess = self.sess, None
+        term, self.term = self.term, None
+        if term:
+            term.close()
         task = self.stream_task
         self.stream_task = None
         if task and not task.done():
@@ -430,6 +686,7 @@ class Controller:
         self.sig = sig
         self.sess = Session(sig, peer_id)
         self.win_size = None  # (w,h) of displayed image
+        self.reneg = None
 
     async def run(self):
         require("opencv-python/mss/pyautogui", HAVE_GUI_LIBS)
@@ -440,6 +697,7 @@ class Controller:
         self.sess.p2p.on_state = self._on_p2p_state
         self.sig.on_bin = self.sess.on_relay_bin
         self.sig.on_msg = self._on_msg
+        self.reneg = Renegotiator(self.sess, self.sig)
         # outgoing p2p offer
         p2p = self.sess.p2p
         p2p.on_frame = self.sess._dispatch
@@ -473,7 +731,12 @@ class Controller:
 
     def _on_p2p_state(self, state):
         if state in ("failed", "closed", "disconnected"):
-            self.sess.closed.set()
+            if self.sess and not self.sess.closed.is_set():
+                print("[!] P2P down -> server relay, renegotiation in background", flush=True)
+                self.sess.use_relay = True
+                self.sess.start_pump()
+                if self.reneg:
+                    self.reneg.start()
 
     async def _wait_transport(self):
         try:
@@ -484,19 +747,46 @@ class Controller:
             pass
         print("[i] transport: server relay", flush=True)
         self.sess.use_relay = True
+        self.sess.start_pump()
+        if self.reneg:
+            self.reneg.start()
 
     async def _on_msg(self, msg):
         t = msg.get("type")
         if t == "answer":
-            await self.sess.p2p.pc.setRemoteDescription(
-                RTCSessionDescription(sdp=msg["sdp"], type=msg["sdpType"]))
-            print("    [p2p] answer accepted", flush=True)
+            try:
+                await self.sess.p2p.pc.setRemoteDescription(
+                    RTCSessionDescription(sdp=msg["sdp"], type=msg["sdpType"]))
+                print(f"    [p2p] answer accepted (gen {msg.get('gen', '?')})", flush=True)
+            except Exception as e:
+                print(f"    [p2p] answer error: {e}", flush=True)
+        elif t == "offer":
+            # host-initiated renegotiation (host is also a controller-capable peer)
+            await self._accept_re_offer(msg)
         elif t == "bye":
             print("[*] remote closed", flush=True)
             self.sess.closed.set()
         elif t == "peer-offline" and msg.get("peer") == self.sess.peer:
             print("[*] remote host went offline", flush=True)
             self.sess.closed.set()
+
+    async def _accept_re_offer(self, msg):
+        try:
+            p2p = self.sess.p2p
+            await p2p.close()
+            p2p.reset()
+            p2p.on_frame = self.sess._dispatch
+            p2p._mk_pc()
+            await p2p.pc.setRemoteDescription(
+                RTCSessionDescription(sdp=msg["sdp"], type=msg["sdpType"]))
+            await p2p.pc.setLocalDescription(await p2p.pc.createAnswer())
+            await self.sig.send({"type": "answer", "to": msg["from"],
+                                 "sdp": p2p.pc.localDescription.sdp,
+                                 "sdpType": p2p.pc.localDescription.type,
+                                 "gen": msg.get("gen")})
+            print(f"    [p2p] re-offer accepted (gen {msg.get('gen', '?')})", flush=True)
+        except Exception as e:
+            print(f"    [p2p] re-offer error: {e}", flush=True)
 
     async def _show_frame(self, payload: bytes):
         img = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
@@ -551,6 +841,168 @@ class Controller:
         await self.sess.close()
 
 
+# ------------------------- terminal controller -------------------------
+
+class TerminalController:
+    """Remote ConPTY terminal over the same session/transport stack.
+    Raw keystrokes are forwarded; ANSI output is printed as-is (Windows
+    Terminal / VSCode / modern consoles render it correctly)."""
+
+    def __init__(self, sig: Signaling, peer_id: str):
+        self.sig = sig
+        self.sess = Session(sig, peer_id)
+        self.reneg = None
+        self.alive = True
+        self._ctl_lock = asyncio.Lock()
+
+    @staticmethod
+    def _enable_vt():
+        # enable ANSI escape processing on classic conhost too
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h = k32.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            if k32.GetConsoleMode(h, ctypes.byref(mode)):
+                k32.SetConsoleMode(h, mode.value | 0x0004)
+        except Exception:
+            pass
+
+    async def run(self):
+        self._enable_vt()
+        self.sess.on_shell = self._on_out
+        self.sess.p2p.on_state = self._on_p2p_state
+        self.sig.on_bin = self.sess.on_relay_bin
+        self.sig.on_msg = self._on_msg
+        self.reneg = Renegotiator(self.sess, self.sig)
+        p2p = self.sess.p2p
+        p2p.on_frame = self.sess._dispatch
+        p2p._mk_pc()
+        p2p.dc = p2p.pc.createDataChannel("p2pdesk")
+        p2p._bind(p2p.dc)
+        await p2p.pc.setLocalDescription(await p2p.pc.createOffer())
+        await self.sig.send({"type": "offer", "to": self.sess.peer,
+                             "sdp": p2p.pc.localDescription.sdp,
+                             "sdpType": p2p.pc.localDescription.type})
+        print("    [p2p] offer sent", flush=True)
+        asyncio.ensure_future(self._wait_transport())
+        print("[i] connecting to terminal ... type 'exit' or press Ctrl+C to quit", flush=True)
+
+        # ask host to spawn the pty
+        await self._send_ctl({"t": "open"})
+        # keystroke loop: read console keys in a thread, forward immediately
+        loop = asyncio.get_event_loop()
+        while self.alive and not self.sess.closed.is_set():
+            data = await loop.run_in_executor(None, self._read_keys)
+            if data is None:
+                break
+            if data:
+                await self._send_ctl({"t": "in", "d": data})
+
+        await self._quit()
+
+    @staticmethod
+    def _read_keys():
+        """Non-canonical key reader on Windows (msvcrt); falls back to lines elsewhere."""
+        try:
+            import msvcrt
+        except ImportError:
+            try:
+                return input() + "\r\n"
+            except (EOFError, KeyboardInterrupt):
+                return None
+        out = []
+        while True:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch == "\x03":  # Ctrl+C -> quit session
+                    return None
+                if ch in ("\x00", "\xe0"):  # special key prefix
+                    ext = msvcrt.getwch()
+                    out.append({"\x00K": "\x1b[D", "\x00M": "\x1b[C", "\x00H": "\x1b[A",
+                                "\x00P": "\x1b[B", "\x00G": "\x1b[H", "\x00O": "\x1b[F",
+                                "\x00S": "\x1b[3~", "\x00R": "\x1b[2~"}.get(ch + ext, ""))
+                    continue
+                out.append(ch)
+                continue
+            if out:
+                time.sleep(0.02)
+                return "".join(out)
+            time.sleep(0.02)
+    async def _send_ctl(self, obj: dict):
+        async with self._ctl_lock:
+            try:
+                await self.sess.route_send(SHELLCTL_PORT, json.dumps(obj).encode())
+            except Exception:
+                pass
+
+    def _on_out(self, payload: bytes):
+        if not payload:
+            return
+        if payload[0:1] == b"\x00":
+            try:
+                msg = json.loads(payload[1:])
+                if msg.get("t") == "closed":
+                    print("\n[*] remote terminal closed", flush=True)
+                    self.alive = False
+            except Exception:
+                pass
+            return
+        try:
+            sys.stdout.write(payload.decode("utf-8", errors="replace"))
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    def _on_p2p_state(self, state):
+        if state in ("failed", "closed", "disconnected"):
+            if self.sess and not self.sess.closed.is_set():
+                print("\n[!] P2P down -> server relay, renegotiation in background", flush=True)
+                self.sess.use_relay = True
+                self.sess.start_pump()
+                if self.reneg:
+                    self.reneg.start()
+
+    async def _wait_transport(self):
+        try:
+            await asyncio.wait_for(self.sess.p2p.ready.wait(), P2P_TIMEOUT)
+            print("[i] transport: P2P direct", flush=True)
+            return
+        except asyncio.TimeoutError:
+            pass
+        print("[i] transport: server relay", flush=True)
+        self.sess.use_relay = True
+        self.sess.start_pump()
+        if self.reneg:
+            self.reneg.start()
+
+    async def _on_msg(self, msg):
+        t = msg.get("type")
+        if t == "answer":
+            try:
+                await self.sess.p2p.pc.setRemoteDescription(
+                    RTCSessionDescription(sdp=msg["sdp"], type=msg["sdpType"]))
+                print(f"    [p2p] answer accepted (gen {msg.get('gen', '?')})", flush=True)
+            except Exception as e:
+                print(f"    [p2p] answer error: {e}", flush=True)
+        elif t == "bye":
+            print("[*] remote closed", flush=True)
+            self.sess.closed.set()
+            self.alive = False
+        elif t == "peer-offline" and msg.get("peer") == self.sess.peer:
+            print("[*] remote host went offline", flush=True)
+            self.sess.closed.set()
+            self.alive = False
+
+    async def _quit(self):
+        self.alive = False
+        try:
+            await asyncio.wait_for(self.sig.send({"type": "bye", "to": self.sess.peer}), 3)
+        except Exception:
+            pass
+        await self.sess.close()
+
+
 # ------------------------- main -------------------------
 
 async def do_list():
@@ -587,6 +1039,10 @@ async def amain():
             if len(args) < 2:
                 die("usage: python p2pdesk.py watch <peer_id>")
             await Controller(sig, args[1]).run()
+        elif cmd == "term":
+            if len(args) < 2:
+                die("usage: python p2pdesk.py term <peer_id>")
+            await TerminalController(sig, args[1]).run()
         else:
             die(f"unknown command {cmd}")
     finally:
