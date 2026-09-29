@@ -48,8 +48,13 @@ load_env()
 
 # ------------------------- config -------------------------
 SERVER_WS = os.environ.get("P2PDESK_SERVER", "ws://118.31.105.6:9000")
-TOKEN = os.environ.get("P2PDESK_TOKEN", "REDACTED-TOKEN")
+TOKEN = os.environ.get("P2PDESK_TOKEN", "")
 SELF_ID = os.environ.get("P2PDESK_ID") or os.environ.get("USERNAME") or os.environ.get("COMPUTERNAME") or "pc"
+
+if not TOKEN:
+    print("[!] P2PDESK_TOKEN not set. Copy client/.env.example to client/.env and fill it in.")
+    sys.exit(1)
+
 FPS = int(os.environ.get("P2PDESK_FPS", "10"))
 JPEG_Q = int(os.environ.get("P2PDESK_Q", "50"))
 P2P_TIMEOUT = int(os.environ.get("P2PDESK_P2P_TIMEOUT", "25"))
@@ -110,21 +115,33 @@ class Signaling:
         self.ws = None
         self.on_msg = None
         self.on_bin = None
+        self.on_disconnect = None
+        self.closed = False
 
     async def connect(self):
-        self.ws = await websockets.connect(SERVER_WS, max_size=16 * 1024 * 1024, ping_interval=20)
-        await self.ws.send(json.dumps({"type": "register", "id": SELF_ID, "token": TOKEN}))
-        resp = json.loads(await asyncio.wait_for(self.ws.recv(), 10))
-        if resp.get("type") != "registered":
-            die(f"register failed: {resp}")
-        print(f"[i] registered as '{SELF_ID}' @ {SERVER_WS}", flush=True)
-        asyncio.ensure_future(self._reader())
+        backoff = 1
+        while True:
+            try:
+                self.ws = await websockets.connect(SERVER_WS, max_size=16 * 1024 * 1024, ping_interval=20)
+                await self.ws.send(json.dumps({"type": "register", "id": SELF_ID, "token": TOKEN}))
+                resp = json.loads(await asyncio.wait_for(self.ws.recv(), 10))
+                if resp.get("type") != "registered":
+                    die(f"register failed: {resp}")
+                print(f"[i] registered as '{SELF_ID}' @ {SERVER_WS}", flush=True)
+                asyncio.ensure_future(self._reader())
+                return
+            except Exception as e:
+                print(f"[!] connect failed: {e}, retry in {backoff}s ...", flush=True)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
     async def send(self, msg: dict):
-        await self.ws.send(json.dumps(msg, ensure_ascii=False))
+        if self.ws:
+            await self.ws.send(json.dumps(msg, ensure_ascii=False))
 
     async def send_bin_to(self, target: str, payload: bytes):
-        await self.ws.send(b"\x01" + target.encode() + b"\x00" + payload)
+        if self.ws:
+            await self.ws.send(b"\x01" + target.encode() + b"\x00" + payload)
 
     async def _reader(self):
         try:
@@ -135,6 +152,15 @@ class Signaling:
                     await self.on_msg(json.loads(raw))
         except Exception:
             pass
+        finally:
+            if not self.closed:
+                print("[!] signaling lost, reconnecting ...", flush=True)
+                if self.on_disconnect:
+                    try:
+                        self.on_disconnect()
+                    except Exception:
+                        pass
+                await self.connect()
 
 
 # ------------------------- p2p channel -------------------------
@@ -146,6 +172,7 @@ class P2PChannel:
         self.ready = asyncio.Event()
         self.on_frame = None
         self.on_open = None
+        self.on_state = None
 
     def _mk_pc(self):
         require("aiortc", HAVE_AIORTC)
@@ -155,7 +182,13 @@ class P2PChannel:
         self.pc.on("datachannel", self._on_remote_dc)
 
     def _on_state(self):
-        print(f"    [p2p] state: {self.pc.connectionState}", flush=True)
+        state = self.pc.connectionState
+        print(f"    [p2p] state: {state}", flush=True)
+        if self.on_state:
+            try:
+                self.on_state(state)
+            except Exception:
+                pass
 
     def _on_remote_dc(self, channel):
         print(f"    [p2p] remote datachannel '{channel.label}'", flush=True)
@@ -194,11 +227,15 @@ class P2PChannel:
         return False
 
     async def close(self):
+        if not self.pc:
+            return
+        pc, self.pc = self.pc, None
+        self.dc = None
         try:
-            if self.pc:
-                await self.pc.close()
+            await asyncio.wait_for(pc.close(), 5)
         except Exception:
-            pass
+            # aiortc close may hang on half-open connections; abandon it
+            print("    [p2p] close timeout, abandoned", flush=True)
 
 
 # ------------------------- shared session -------------------------
@@ -213,6 +250,11 @@ class Session:
         self.use_relay = False
         self.on_event = None   # controller input events (host side)
         self.on_frame = None   # screen frames (controller side)
+        self.closed = asyncio.Event()
+
+    async def close(self):
+        self.closed.set()
+        await self.p2p.close()
 
     async def route_send(self, port: int, payload: bytes):
         if self.p2p.is_open():
@@ -251,6 +293,7 @@ class Host:
         self.sig = sig
         self.sess = None
         self.stream_task = None
+        self.sig.on_disconnect = self._on_sig_lost
 
     async def run(self):
         require("opencv-python/mss/pyautogui", HAVE_GUI_LIBS)
@@ -260,20 +303,31 @@ class Host:
         while True:
             await asyncio.sleep(3600)
 
+    def _on_sig_lost(self):
+        asyncio.ensure_future(self._stop(quiet=True))
+
     async def _on_msg(self, msg):
         t = msg.get("type")
         if t == "offer":
             print(f"[*] incoming connection from '{msg['from']}'", flush=True)
+            await self._stop(quiet=True)
             self._new_session(msg["from"])
             await self._accept_offer(msg)
             asyncio.ensure_future(self._wait_transport())
         elif t == "bye":
             await self._stop()
+        elif t == "peer-offline" and self.sess and msg.get("peer") == self.sess.peer:
+            await self._stop()
 
     def _new_session(self, peer):
         self.sess = Session(self.sig, peer)
         self.sess.on_event = self.exec_event
+        self.sess.p2p.on_state = self._on_p2p_state
         self.sig.on_bin = self._on_bin
+
+    def _on_p2p_state(self, state):
+        if state in ("failed", "closed", "disconnected"):
+            asyncio.ensure_future(self._stop())
 
     async def _accept_offer(self, msg):
         p2p = self.sess.p2p
@@ -303,13 +357,22 @@ class Host:
             return
         self.stream_task = asyncio.ensure_future(self._screen_loop())
 
-    async def _stop(self):
-        print("[*] session closed by peer", flush=True)
-        if self.stream_task:
-            self.stream_task.cancel()
-        if self.sess:
-            await self.sess.p2p.close()
-        self.sess = None
+    async def _stop(self, quiet=False):
+        if not self.sess:
+            return
+        if not quiet:
+            print("[*] session closed by peer", flush=True)
+        sess, self.sess = self.sess, None
+        task = self.stream_task
+        self.stream_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, 5)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+        await sess.p2p.close()
+        print("[i] session stopped, waiting for next connection ...", flush=True)
 
     async def _on_bin(self, raw):
         if self.sess:
@@ -323,14 +386,17 @@ class Host:
         while True:
             t0 = time.time()
             try:
+                sess = self.sess
+                if sess is None:
+                    return
                 img = np.array(sct.grab(mon))
                 frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
                 ok, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_Q])
                 if ok:
-                    await self.sess.route_send(FRAME_PORT, jpeg.tobytes())
+                    await sess.route_send(FRAME_PORT, jpeg.tobytes())
             except asyncio.CancelledError:
                 return
-            except Exception as e:
+            except Exception:
                 await asyncio.sleep(1)
             await asyncio.sleep(max(0.0, interval - (time.time() - t0)))
 
@@ -371,6 +437,7 @@ class Controller:
         cv2.resizeWindow("p2pdesk", 1280, 720)
         cv2.setMouseCallback("p2pdesk", self._on_mouse)
         self.sess.on_frame = self._show_frame
+        self.sess.p2p.on_state = self._on_p2p_state
         self.sig.on_bin = self.sess.on_relay_bin
         self.sig.on_msg = self._on_msg
         # outgoing p2p offer
@@ -385,16 +452,28 @@ class Controller:
                              "sdpType": p2p.pc.localDescription.type})
         print("    [p2p] offer sent", flush=True)
         asyncio.ensure_future(self._wait_transport())
-        print("[i] connecting ... ESC/q to quit", flush=True)
+        print("[i] connecting ... ESC/q or close window to quit", flush=True)
         while True:
             await asyncio.sleep(0.02)
+            if self.sess.closed.is_set():
+                break
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
+                break
+            # window closed via X -> imshow would recreate it, so detect and quit
+            try:
+                if cv2.getWindowProperty("p2pdesk", cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except cv2.error:
                 break
             if 32 <= key < 127:
                 asyncio.ensure_future(self.sess.route_send(
                     CMD_PORT, json.dumps({"kind": "text", "text": chr(key)}).encode()))
         await self._quit()
+
+    def _on_p2p_state(self, state):
+        if state in ("failed", "closed", "disconnected"):
+            self.sess.closed.set()
 
     async def _wait_transport(self):
         try:
@@ -414,6 +493,10 @@ class Controller:
             print("    [p2p] answer accepted", flush=True)
         elif t == "bye":
             print("[*] remote closed", flush=True)
+            self.sess.closed.set()
+        elif t == "peer-offline" and msg.get("peer") == self.sess.peer:
+            print("[*] remote host went offline", flush=True)
+            self.sess.closed.set()
 
     async def _show_frame(self, payload: bytes):
         img = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
@@ -458,11 +541,14 @@ class Controller:
 
     async def _quit(self):
         try:
-            await self.sig.send({"type": "bye", "to": self.sess.peer})
+            await asyncio.wait_for(self.sig.send({"type": "bye", "to": self.sess.peer}), 3)
         except Exception:
             pass
-        cv2.destroyAllWindows()
-        await self.sess.p2p.close()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        await self.sess.close()
 
 
 # ------------------------- main -------------------------
@@ -494,14 +580,20 @@ async def amain():
         return
     sig = Signaling()
     await sig.connect()
-    if cmd == "share":
-        await Host(sig).run()
-    elif cmd == "watch":
-        if len(args) < 2:
-            die("usage: python p2pdesk.py watch <peer_id>")
-        await Controller(sig, args[1]).run()
-    else:
-        die(f"unknown command {cmd}")
+    try:
+        if cmd == "share":
+            await Host(sig).run()
+        elif cmd == "watch":
+            if len(args) < 2:
+                die("usage: python p2pdesk.py watch <peer_id>")
+            await Controller(sig, args[1]).run()
+        else:
+            die(f"unknown command {cmd}")
+    finally:
+        try:
+            await sig.ws.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
@@ -509,3 +601,6 @@ if __name__ == "__main__":
         asyncio.run(amain())
     except KeyboardInterrupt:
         print("\nbye", flush=True)
+    finally:
+        # ensure the process really exits even if aiortc/dtls tasks linger
+        os._exit(0)
